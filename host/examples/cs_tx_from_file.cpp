@@ -68,6 +68,11 @@ void recv_and_transmit(
 
     // read data from file
     std::ifstream infile(file.c_str(), std::ifstream::binary);
+    if (not infile.is_open()) {
+        std::cout << "Couldn't read I/Q samples from file, exiting." << std::endl;
+        return;
+    }
+
     float tmp;
     std::vector<float> packet = std::vector<float>();
     while(1) {
@@ -80,18 +85,17 @@ void recv_and_transmit(
        packet.push_back(tmp);
     }
     size_t samples = packet.size();
-
     std::cout << "sending data / packet length: " << samples << std::endl;
 
+    unsigned int num_tx = 0;
     while(1) {
-        unsigned int n = 0;
         md.start_of_burst = true;
         md.end_of_burst = false;
         md.use_cs = use_cs;
         md.backoffs[0] = rand() % 32;
         md.backoffs[1] = rand() % 64;
-        tx_streamer->send(&packet.front() + n, samples/2, md, 3600);
-        std::cout << "send: " << n << std::endl;
+        tx_streamer->send(&packet.front(), samples / 2, md, 1);
+        std::cout << "send: " << num_tx++ << std::endl;
 
         // send eob packet
         md.start_of_burst = false;
@@ -102,7 +106,7 @@ void recv_and_transmit(
         uhd::async_metadata_t async_md;
         while(1) {
 
-            if(usrp->get_device()->recv_async_msg(async_md,3600)) {
+            if(usrp->get_device()->recv_async_msg(async_md, 3600)) {
                 switch(async_md.event_code) {
 
                 case uhd::async_metadata_t::EVENT_CODE_BURST_ACK:
@@ -139,7 +143,7 @@ void recv_and_transmit(
 
         }
 next:
-        if(delay >=  0.0) boost::this_thread::sleep(boost::posix_time::milliseconds(delay));
+        if (delay > 0.0) boost::this_thread::sleep(boost::posix_time::milliseconds(delay));
     }
 }
 
@@ -161,19 +165,19 @@ int UHD_SAFE_MAIN(int argc, char *argv[]){
         ("args", po::value<std::string>(&args)->default_value(""), "single uhd device address args")
 
         // phy
-        ("rate", po::value<double>(&rate)->default_value(2000e3), "rate of incoming samples")
-        ("freq",po::value<double>(&freq)->default_value(2400e6),"Sets Center Frequency")
+        ("rate", po::value<double>(&rate)->default_value(10e6), "rate of incoming samples")
+        ("freq",po::value<double>(&freq)->default_value(2472e6),"Sets Center Frequency")
         ("rxgain",po::value<double>(&rxGain)->default_value(5),"Sets receive gain")
-        ("txgain",po::value<double>(&txGain)->default_value(32),"Sets transmit gain")
+        ("txgain",po::value<double>(&txGain)->default_value(25),"Sets transmit gain")
 
         // csma
         ("use-cs", po::value<bool>(&use_cs)->default_value(true), "enable or disable usrp carrier sense")
         ("slot-time", po::value<uint16_t>(&slot_time)->default_value(10000), "slot-time for usrp carrier sense mechanism")
-        ("cs-hw-threshold", po::value<uint16_t>(&threshold)->default_value(50), "threshold for usrp carrier sense")
+        ("cs-hw-threshold", po::value<uint16_t>(&threshold)->default_value(500), "threshold for usrp carrier sense")
 
         // file
         ("file", po::value<std::string>(&file)->default_value("usrp_samples.dat"), "name of the file to read binary samples from")
-        ("delay", po::value<double>(&delay)->default_value(0.0), "specify a delay between repeated transmission of file")
+        ("delay", po::value<double>(&delay)->default_value(200.0), "specify a delay between repeated transmission of file")
     ;
 
     po::variables_map vm;
@@ -192,9 +196,23 @@ int UHD_SAFE_MAIN(int argc, char *argv[]){
     uhd::usrp::multi_usrp::sptr usrp = uhd::usrp::multi_usrp::make(args);
     std::cout << boost::format("Using Device: %s") % usrp->get_pp_string() << std::endl;
 
+
+    // prepare tune_requst
+    double lo_offset = rate / 2; // set LO offset to half of the signal rate by default
+    uhd::tune_request_t tune_request(freq, lo_offset /* - 3e6*/);
+#if 1
+    tune_request.rf_freq = freq + lo_offset;
+    tune_request.rf_freq_policy = uhd::tune_request_t::POLICY_MANUAL;
+
+    tune_request.dsp_freq_policy = uhd::tune_request_t::POLICY_AUTO;
+    tune_request.dsp_freq = 0.0;
+#endif
+
+
     // setup RX
     std::cout << boost::format("Setting RX Center Frequency: %f") % freq << std::endl;
-    usrp->set_rx_freq(freq);
+    uhd::tune_result_t rx_tune_result = usrp->set_rx_freq(tune_request);
+    std::cout << rx_tune_result.to_pp_string() << std::endl;
     std::cout << boost::format("Setting RX Gain %f") % rxGain << std::endl;
     usrp->set_rx_gain(rxGain);
     std::cout << boost::format("Setting RX Rate: %f Msps...") % (rate/1e6) << std::endl;
@@ -203,7 +221,8 @@ int UHD_SAFE_MAIN(int argc, char *argv[]){
 
     // setup TX
     std::cout << boost::format("Setting TX Center Frequency: %f") % freq << std::endl;
-    usrp->set_tx_freq(freq);
+    uhd::tune_result_t tx_tune_result = usrp->set_tx_freq(tune_request);
+    std::cout << tx_tune_result.to_pp_string() << std::endl;
     std::cout << boost::format("Setting TX Gain %f") % txGain << std::endl;
     usrp->set_tx_gain(txGain);
     std::cout << boost::format("Setting TX Rate: %f Msps...") % (rate/1e6) << std::endl;
@@ -212,6 +231,22 @@ int UHD_SAFE_MAIN(int argc, char *argv[]){
 
     std::cout << boost::format("Setting device timestamp to 0...") << std::endl;
     usrp->set_time_now(uhd::time_spec_t(0.0));
+
+#if 0
+    // check LO lock detect
+    std::vector<std::string> sensor_names;
+    sensor_names = usrp->get_rx_sensor_names(0);
+    if (std::find(sensor_names.begin(), sensor_names.end(), "lo_locked") != sensor_names.end())
+    {
+        uhd::sensor_value_t lo_locked = usrp->get_rx_sensor("lo_locked",0);
+        std::cout << "Checking TX: " << lo_locked.to_pp_string() << " ..." << std::endl;
+        if(!lo_locked.to_bool()) {
+            std::cout  << "Failed to lock LO" << std::endl;
+            return 1;
+        }
+    }
+#endif
+
 
     // setup CSMA
     usrp->set_csma_slottime(slot_time);
